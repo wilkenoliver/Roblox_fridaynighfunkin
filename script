@@ -1,0 +1,1380 @@
+--[[
+    Funky Friday Autoplayer — Rayfield Gen2
+    Feito por: fal
+    Refatorado: UI em abas, humanização, keybinds configuráveis,
+    painel de status, auto-rebind por eventos, cache de especiais,
+    suporte 4K–12K, Unload robusto.
+
+    v3 — Timing velocity-aware:
+      - Modo "Auto" mede a velocidade real das notas e dispara quando
+        elas cruzam a judgment line. Funciona em qualquer scroll speed.
+      - Modo "Fixed" mantém o comportamento antigo (baseMs fixo).
+
+    v3.1 — Defaults ajustados (Timing):
+      Timing Offset = -139 ms
+      Fixed Delay   = 80 ms
+      Tap Hold      = 5 ms
+      Release Delay = 0 ms
+      Max Hold      = 1 s
+      Min Velocity  = 50 px/s
+      Velocity Smoothing = 0 % (sem suavização)
+]]
+
+local ENV = (getgenv and getgenv()) or _G
+
+if type(ENV.__FunkyFridayAutoplayer) == "table"
+    and type(ENV.__FunkyFridayAutoplayer.Unload) == "function" then
+    pcall(function() ENV.__FunkyFridayAutoplayer:Unload() end)
+end
+
+-- ============================================================
+-- Resolver de serviços
+-- ============================================================
+local __lt = (function()
+    local globalEnv = (getgenv and getgenv()) or _G or {}
+    local sharedEnv = rawget(_G, "shared")
+    local cacheHost = type(sharedEnv) == "table" and sharedEnv
+        or (type(globalEnv) == "table" and globalEnv or nil)
+    if cacheHost then
+        local cached = rawget(cacheHost, "__lt_service_resolver")
+        if type(cached) == "table" then return cached end
+    end
+    local loader = loadstring or load
+    if type(loader) ~= "function" then error("Service resolver loader unavailable") end
+    local resolver = loader(game:HttpGet("https://ltseverydayyou.github.io/ServiceResolver.luau"), "@ServiceResolver.luau")
+    if type(resolver) ~= "function" then error("Service resolver failed to compile") end
+    local loaded = resolver()
+    if type(loaded) ~= "table" then error("Service resolver failed to load") end
+    if cacheHost then cacheHost.__lt_service_resolver = loaded end
+    return loaded
+end)()
+
+local Players              = __lt.cs("Players", cloneref)
+local RunService           = __lt.cs("RunService", cloneref)
+local VirtualInputManager  = __lt.cs("VirtualInputManager", cloneref)
+local UserInputService     = __lt.cs("UserInputService", cloneref)
+
+local Client     = Players.LocalPlayer
+local PlayerGui  = Client:WaitForChild("PlayerGui")
+
+local IsDesktop  = UserInputService.KeyboardEnabled and not UserInputService.TouchEnabled
+local HasFireSignal = type(firesignal) == "function"
+local HasVirtualInput = VirtualInputManager ~= nil
+local HasScriptableInput = pcall(function()
+    local b = Instance.new("InputBinding")
+    b.Type = Enum.InputBindingType.Scriptable
+    b:Destroy()
+end)
+
+local IsExternal = IsDesktop and not HasFireSignal
+
+local InputModes = {}
+if HasFireSignal        then table.insert(InputModes, "firesignal") end
+if HasScriptableInput   then table.insert(InputModes, "Scriptable Input") end
+if HasVirtualInput      then table.insert(InputModes, "Virtual Input") end
+if #InputModes == 0     then error("No supported input method found") end
+local DefaultInputMode  = InputModes[1]
+
+-- ============================================================
+-- Helpers
+-- ============================================================
+local function clamp(v, lo, hi)
+    if v < lo then return lo elseif v > hi then return hi else return v end
+end
+
+-- ============================================================
+-- Estado
+-- ============================================================
+local st = {
+    alive = true,
+    author = "fal",
+
+    -- Autoplay
+    auto = true,
+    inMode = DefaultInputMode,
+    accuracy = 100,
+    off = -139,               -- Timing Offset (default das prints)
+    baseMs = 80,              -- Fixed Delay / fallback (default das prints)
+    tapMs = 5,                -- Tap Hold Time (default das prints)
+    relMs = 0,                -- Release Delay (default das prints)
+    holdTick = 0.015,
+    maxHold = 1,              -- Max Hold Time (default das prints)
+
+    -- TIMING
+    timingMode = "Auto",
+    minVelocity = 50,         -- px/s
+    velocitySmoothing = 0,    -- 0 = sem suavização (amostra crua)
+    preHitWindowSec = 1.5,
+    farPollInterval = 0.20,
+    nearPollInterval = 0.008,
+    nearThresholdSec = 0.30,
+
+    -- Humanização
+    humanize = true,
+    jitterMs = 4,
+    missChance = 0,
+    missCooldownNotes = 6,
+    lastMissAt = 0,
+
+    -- Especiais
+    ignoreDeath = true,
+    ignorePoison = true,
+    enableHolds = true,
+
+    -- Debug
+    debug = false,
+
+    -- Keybinds
+    keyAutoplay = Enum.KeyCode.RightShift,
+    keyHideUi   = Enum.KeyCode.RightControl,
+
+    -- Runtime
+    boundWindow = nil,
+    boundLanes = 0,
+    laneDown = {},
+    laneCount = {},
+    Session = {},
+    LaneJudgmentY = {},
+    ActionKeyCache = {},
+    ActiveTasks = 0,
+    ScriptBindings = setmetatable({}, {__mode = "k"}),
+
+    -- Pool de notas monitoradas
+    NoteWatchers = {},
+
+    -- Estatísticas
+    Stats = {
+        hits = 0, perfect = 0, great = 0, ok = 0, miss = 0, skipped = 0,
+        lastReset = os.clock(),
+    },
+
+    RayfieldWindow = nil,
+    FieldWatch = nil,
+    GuiWatch = nil,
+    ConfigWatch = nil,
+    SpecialPageWatch = nil,
+    NoteWatcherHeartbeat = nil,
+    InputModes = InputModes,
+    Capabilities = {
+        External = IsExternal,
+        FireSignal = HasFireSignal,
+        VirtualInput = HasVirtualInput,
+        ScriptableInput = HasScriptableInput,
+    },
+    SpecialNotes = {
+        Death  = { Images = {}, Signatures = {} },
+        Poison = { Images = {}, Signatures = {} },
+        Ready = false,
+        Refreshing = false,
+    },
+}
+ENV.__FunkyFridayAutoplayer = st
+
+-- ============================================================
+-- Logging
+-- ============================================================
+local function log(...)
+    if st.debug then
+        print("[FF-Autoplayer | fal]", ...)
+    end
+end
+
+-- ============================================================
+-- Input helpers
+-- ============================================================
+local function getLaneKeyCode(action)
+    if not action then return nil end
+    local cached = st.ActionKeyCache[action]
+    if cached and cached ~= Enum.KeyCode.Unknown then return cached end
+    for _, child in ipairs(action:GetChildren()) do
+        if child:IsA("InputBinding") then
+            local kc = child.KeyCode
+            if kc and kc ~= Enum.KeyCode.Unknown then
+                st.ActionKeyCache[action] = kc
+                return kc
+            end
+        end
+    end
+    return nil
+end
+
+local function getScriptBinding(action)
+    if not action then return nil end
+    local binding = st.ScriptBindings[action]
+    if binding and binding.Parent == action then return binding end
+    binding = Instance.new("InputBinding")
+    binding.Name = "FFAutoplayerScriptBinding"
+    binding.Type = Enum.InputBindingType.Scriptable
+    binding.Parent = action
+    st.ScriptBindings[action] = binding
+    return binding
+end
+
+local function fireAction(action, down)
+    if not action then return false end
+    if st.inMode == "Scriptable Input" then
+        if not HasScriptableInput then return false end
+        local binding = getScriptBinding(action)
+        if not binding then return false end
+        return pcall(function() binding:Fire(down) end)
+    end
+    if st.inMode == "firesignal" then
+        if not HasFireSignal then return false end
+        return pcall(firesignal, down and action.Pressed or action.Released)
+    end
+    return false
+end
+
+local function pressLane(_, action)
+    if st.inMode ~= "Virtual Input" then
+        fireAction(action, true)
+        return
+    end
+    local kc = getLaneKeyCode(action)
+    if kc and HasVirtualInput then
+        pcall(function() VirtualInputManager:SendKeyEvent(true, kc, false, game) end)
+    end
+end
+
+local function releaseLane(_, action)
+    if st.inMode ~= "Virtual Input" then
+        fireAction(action, false)
+        return
+    end
+    local kc = getLaneKeyCode(action)
+    if kc and HasVirtualInput then
+        pcall(function() VirtualInputManager:SendKeyEvent(false, kc, false, game) end)
+    end
+end
+
+local function releaseAll()
+    for Holder, down in pairs(st.laneDown) do
+        if down then
+            local action = st.Session[Holder.Name]
+            if action then releaseLane(Holder.Name, action) end
+            st.laneDown[Holder] = false
+        end
+    end
+    for Holder in pairs(st.laneCount) do
+        st.laneCount[Holder] = 0
+    end
+end
+
+-- ============================================================
+-- Holds / especiais
+-- ============================================================
+local function getHoldTail(Arrow)
+    if not Arrow then return nil end
+    for _, child in ipairs(Arrow:GetChildren()) do
+        if child:IsA("GuiObject") and child.ZIndex == 1 then return child end
+    end
+    return nil
+end
+
+local function isHold(Arrow)
+    local tail = getHoldTail(Arrow)
+    if not tail or not tail.Parent or not tail.Visible then return false end
+    return math.abs(tail.AbsoluteSize.Y) > 0.5
+end
+
+local function imageSignature(imageObject)
+    if not imageObject then return nil end
+    local image = imageObject.Image
+    if not image or image == "" then return nil end
+    local c = imageObject.ImageColor3
+    return string.format("%s|%d|%d|%d", image,
+        math.round(c.R * 255), math.round(c.G * 255), math.round(c.B * 255))
+end
+
+local function collectSpecialPreview(root)
+    local data = { Images = {}, Signatures = {} }
+    if not root then return data end
+    for _, direction in ipairs({"Left", "Down", "Up", "Right"}) do
+        local frame = root:FindFirstChild(direction)
+        local layered = frame and frame:FindFirstChild("LayeredSprite")
+        if layered then
+            for _, imageObject in ipairs(layered:GetChildren()) do
+                if imageObject:IsA("ImageLabel") or imageObject:IsA("ImageButton") then
+                    local image = imageObject.Image
+                    if image and image ~= "" then data.Images[image] = true end
+                    local sig = imageSignature(imageObject)
+                    if sig then data.Signatures[sig] = true end
+                end
+            end
+        end
+    end
+    return data
+end
+
+local function withGameIdentity(callback)
+    local oldIdentity, canSet = nil, type(setthreadidentity) == "function"
+    if type(getthreadidentity) == "function" then
+        pcall(function() oldIdentity = getthreadidentity() end)
+    end
+    if canSet then pcall(setthreadidentity, 2) end
+    local results = table.pack(pcall(callback))
+    if canSet and oldIdentity ~= nil then pcall(setthreadidentity, oldIdentity) end
+    return table.unpack(results, 1, results.n)
+end
+
+local function clickGuiButton(button)
+    if not button then return false end
+    if HasFireSignal then
+        local ok = withGameIdentity(function() firesignal(button.MouseButton1Click) end)
+        return ok == true
+    end
+    if not HasVirtualInput or not button:IsA("GuiButton") or not button.Visible then
+        return false
+    end
+    local pos, size = button.AbsolutePosition, button.AbsoluteSize
+    if size.X <= 0 or size.Y <= 0 then return false end
+    local x = math.floor(pos.X + size.X * 0.5)
+    local y = math.floor(pos.Y + size.Y * 0.5)
+    if x < 0 or y < 0 then return false end
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize
+    if vp and (x > vp.X or y > vp.Y) then return false end
+    return pcall(function()
+        VirtualInputManager:SendMouseMoveEvent(x, y, game)
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        RunService.RenderStepped:Wait()
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end)
+end
+
+local function getSpecialSettingsUi()
+    local gameGui = PlayerGui:FindFirstChild("GameGui")
+    local windows = gameGui and gameGui:FindFirstChild("Windows")
+    local configuration = windows and windows:FindFirstChild("Configuration")
+    local frame = configuration and configuration:FindFirstChild("Frame")
+    local body = frame and frame:FindFirstChild("Body")
+    local content = body and body:FindFirstChild("Content")
+    local arrows = content and content:FindFirstChild("Arrows")
+    local arrowsContent = arrows and arrows:FindFirstChild("Content")
+    local notesPage = arrowsContent and arrowsContent:FindFirstChild("Notes")
+    local notesList = notesPage and notesPage:FindFirstChild("Notes")
+    local scrolling = notesList and notesList:FindFirstChild("ScrollingFrame")
+    local options = notesPage and notesPage:FindFirstChild("Options")
+    local bottom = options and options:FindFirstChild("Bottom")
+    local arrowsPreview = bottom and bottom:FindFirstChild("Arrows")
+    local inner = arrowsPreview and arrowsPreview:FindFirstChild("Inner")
+    local previewRoot = inner and inner:FindFirstChild("Arrows")
+    local top = options and options:FindFirstChild("Top")
+    local title = top and top:FindFirstChild("Title")
+    return {
+        Configuration = configuration,
+        Death = scrolling and scrolling:FindFirstChild("Death"),
+        Poison = scrolling and scrolling:FindFirstChild("Poison"),
+        Preview = previewRoot,
+        Title = title,
+        NotesPage = notesPage,
+    }
+end
+
+local function refreshSpecialNoteSkins()
+    if st.SpecialNotes.Refreshing or not st.alive then return st.SpecialNotes.Ready end
+    st.SpecialNotes.Refreshing = true
+
+    local ok, result = pcall(function()
+        local ui = getSpecialSettingsUi()
+        if not ui or not ui.Configuration then return false end
+
+        local ready = false
+        if ui.Preview then
+            for _, child in ipairs(ui.Preview:GetChildren()) do
+                if child:FindFirstChild("LayeredSprite") then ready = true; break end
+            end
+        end
+
+        local openedByUs = false
+        if not ready then
+            local topBar = PlayerGui:FindFirstChild("TopBar")
+            local topFrame = topBar and topBar:FindFirstChild("Frame")
+            local left = topFrame and topFrame:FindFirstChild("Left")
+            local configButton = left and left:FindFirstChild("Configuration")
+            if not configButton then return false end
+            if not ui.Configuration.Visible then
+                clickGuiButton(configButton)
+                RunService.RenderStepped:Wait()
+                RunService.RenderStepped:Wait()
+                openedByUs = true
+            end
+            if ui.Preview then
+                for _, child in ipairs(ui.Preview:GetChildren()) do
+                    if child:FindFirstChild("LayeredSprite") then ready = true; break end
+                end
+            end
+        end
+        if not ready then return false end
+
+        local originalTitle = ui.Title and ui.Title.Text or ""
+        local originalSelection
+        if string.find(originalTitle, "Poison", 1, true) then
+            originalSelection = "Poison"
+        elseif string.find(originalTitle, "Death", 1, true) then
+            originalSelection = "Death"
+        end
+
+        local function capture(name)
+            local button = ui[name]
+            if not button or not clickGuiButton(button) then return nil end
+            RunService.RenderStepped:Wait()
+            return collectSpecialPreview(ui.Preview)
+        end
+
+        local death  = capture("Death")
+        local poison = capture("Poison")
+
+        if death and next(death.Images) then st.SpecialNotes.Death = death end
+        if poison and next(poison.Images) then st.SpecialNotes.Poison = poison end
+
+        if originalSelection and ui[originalSelection] then
+            clickGuiButton(ui[originalSelection])
+            RunService.RenderStepped:Wait()
+        end
+
+        if openedByUs then
+            local topBar = PlayerGui:FindFirstChild("TopBar")
+            local topFrame = topBar and topBar:FindFirstChild("Frame")
+            local left = topFrame and topFrame:FindFirstChild("Left")
+            local configButton = left and left:FindFirstChild("Configuration")
+            if configButton and ui.Configuration.Visible then
+                clickGuiButton(configButton)
+            end
+        end
+
+        st.SpecialNotes.Ready =
+            next(st.SpecialNotes.Death.Images) ~= nil
+            and next(st.SpecialNotes.Poison.Images) ~= nil
+
+        log("Special notes refreshed. Ready =", st.SpecialNotes.Ready)
+        return st.SpecialNotes.Ready
+    end)
+
+    st.SpecialNotes.Refreshing = false
+    if not ok then
+        log("refreshSpecialNoteSkins error:", result)
+        return false
+    end
+    return result
+end
+
+local function getSpecialNoteType(Arrow)
+    if not Arrow then return nil end
+    local head
+    for _, child in ipairs(Arrow:GetChildren()) do
+        if child:IsA("GuiObject") and child.ZIndex == 2 then head = child; break end
+    end
+    if not head then return nil end
+
+    local death, poison = st.SpecialNotes.Death, st.SpecialNotes.Poison
+
+    for _, imageObject in ipairs(head:GetChildren()) do
+        if imageObject:IsA("ImageLabel") or imageObject:IsA("ImageButton") then
+            local image = imageObject.Image
+            local sig = imageSignature(imageObject)
+
+            if sig then
+                if death.Signatures[sig] then return "Death" end
+                if poison.Signatures[sig] then return "Poison" end
+            end
+
+            local inDeath  = image and death.Images[image] or false
+            local inPoison = image and poison.Images[image] or false
+
+            if inDeath and not inPoison then return "Death" end
+            if inPoison and not inDeath then return "Poison" end
+        end
+    end
+    return nil
+end
+
+-- ============================================================
+-- Humanização / decisão de hit
+-- ============================================================
+local function decideAction(isHoldNote)
+    if st.missChance > 0 then
+        local notesSinceLast = st.Stats.perfect + st.Stats.great + st.Stats.ok + st.Stats.miss - st.lastMissAt
+        if notesSinceLast >= st.missCooldownNotes and math.random() * 100 < st.missChance then
+            st.lastMissAt = st.Stats.perfect + st.Stats.great + st.Stats.ok + st.Stats.miss + 1
+            return "Miss", 0
+        end
+    end
+
+    if st.accuracy <= 0 or math.random() * 100 > st.accuracy then
+        return "Miss", 0
+    end
+
+    local roll = math.random() * 100
+    local quality
+    if roll <= 70 then quality = "Perfect"
+    elseif roll <= 95 then quality = "Great"
+    else quality = "Ok" end
+
+    local jitter = 0
+    if st.humanize and st.jitterMs > 0 then
+        local u1 = math.max(math.random(), 1e-9)
+        local u2 = math.random()
+        jitter = math.sqrt(-2 * math.log(u1)) * math.cos(2 * math.pi * u2) * (st.jitterMs / 1000)
+    end
+
+    local qualityOffset = (quality == "Perfect" and 0)
+        or (quality == "Great" and 0.010)
+        or (quality == "Ok" and 0.025) or 0
+
+    if isHoldNote then qualityOffset = qualityOffset * 0.5 end
+
+    return quality, jitter + qualityOffset
+end
+
+-- ============================================================
+-- Judgment line
+-- ============================================================
+local function computeJudgmentY(Holder)
+    if not Holder then return nil end
+    local abs, size = Holder.AbsolutePosition, Holder.AbsoluteSize
+    if not abs or not size or size.Y <= 0 then return nil end
+    return abs.Y + size.Y
+end
+
+-- ============================================================
+-- Watcher de notas
+-- ============================================================
+local noteWatchers = st.NoteWatchers
+
+local function resetWatcher(w, holder, action)
+    w.holder = holder
+    w.action = action
+    w.isHold = false
+    w.judged = false
+    w.started = os.clock()
+    w.lastY = nil
+    w.lastT = nil
+    w.velocity = 0
+    w.judgmentY = st.LaneJudgmentY[holder]
+    w.extraDelay = 0
+    w.decidedQuality = nil
+    w.holdStarted = false
+    w.framesSeen = 0
+end
+
+local function updateWatcherSample(w, arrow)
+    if not arrow or not arrow.Parent then return end
+    local y = arrow.AbsolutePosition.Y
+    local now = os.clock()
+    if w.lastY and w.lastT then
+        local dt = now - w.lastT
+        if dt > 1e-4 then
+            local dy = y - w.lastY
+            local v = dy / dt
+            if w.velocity == 0 then
+                w.velocity = v
+            else
+                -- 0 = sem suavização (usa amostra crua); >0 = EMA
+                local a = (st.velocitySmoothing <= 0) and 1 or st.velocitySmoothing
+                w.velocity = w.velocity * (1 - a) + v * a
+            end
+        end
+    end
+    w.lastY = y
+    w.lastT = now
+    w.framesSeen = (w.framesSeen or 0) + 1
+end
+
+local function performHit(w, context)
+    local Holder = w.holder
+    local action = w.action
+    local Arrow  = w.arrowRef
+
+    if not action or not Holder then return end
+    if not st.auto then return end
+
+    if context.laneDown[Holder] then
+        context.release(Holder.Name, action)
+    end
+
+    context.press(Holder.Name, action)
+    context.laneDown[Holder] = true
+    context.laneCount[Holder] = (context.laneCount[Holder] or 0) + 1
+
+    local holdNote = isHold(Arrow)
+    if holdNote and st.enableHolds then
+        w.holdStarted = true
+        task.spawn(function()
+            local untilTime = os.clock() + math.max(0.05, st.maxHold)
+            while Arrow and Arrow.Parent and Arrow.Visible and st.auto
+                  and os.clock() <= untilTime do
+                if not isHold(Arrow) then break end
+                task.wait(math.max(0.005, st.holdTick))
+            end
+            if st.humanize and st.jitterMs > 0 then
+                task.wait(math.random() * (st.jitterMs / 1000))
+            end
+            context.laneCount[Holder] = math.max((context.laneCount[Holder] or 1) - 1, 0)
+            if context.laneCount[Holder] <= 0 then
+                context.laneCount[Holder] = 0
+                if context.laneDown[Holder] then
+                    context.release(Holder.Name, action)
+                    context.laneDown[Holder] = false
+                end
+            end
+        end)
+    else
+        task.spawn(function()
+            task.wait(math.max(0, st.tapMs) / 1000)
+            if st.relMs and st.relMs > 0 then
+                task.wait(st.relMs / 1000)
+            end
+            context.laneCount[Holder] = math.max((context.laneCount[Holder] or 1) - 1, 0)
+            if context.laneCount[Holder] <= 0 then
+                context.laneCount[Holder] = 0
+                if context.laneDown[Holder] then
+                    context.release(Holder.Name, action)
+                    context.laneDown[Holder] = false
+                end
+            end
+        end)
+    end
+end
+
+local AutoCtx -- forward declaration
+
+local function noteWatcherTick()
+    if not st.alive then return end
+
+    local now = os.clock()
+    local toRemove = nil
+
+    for arrow, w in pairs(noteWatchers) do
+        if not arrow.Parent or not arrow.Visible then
+            if not w.judged and w.decidedQuality ~= "Miss" then
+                st.Stats.miss += 1
+            end
+            toRemove = toRemove or {}
+            table.insert(toRemove, arrow)
+        elseif not st.auto then
+            toRemove = toRemove or {}
+            table.insert(toRemove, arrow)
+        elseif not w.judged then
+            updateWatcherSample(w, arrow)
+
+            local jY = w.judgmentY
+            if not jY then
+                jY = computeJudgmentY(w.holder)
+                w.judgmentY = jY
+            end
+
+            if jY then
+                local y = arrow.AbsolutePosition.Y
+                local dist = jY - y
+                local v = w.velocity
+
+                local timeToHit
+                if v and v >= st.minVelocity then
+                    timeToHit = dist / v
+                end
+
+                if timeToHit then
+                    local lead = st.tapMs / 1000 * 0.5
+                    local effective = timeToHit - lead - w.extraDelay + (st.off / 1000)
+
+                    if effective <= 0 then
+                        w.judged = true
+                        performHit(w, AutoCtx)
+                    end
+                else
+                    local elapsed = now - w.started
+                    local fallback = (st.baseMs / 1000) - (st.off / 1000) - w.extraDelay
+                    if elapsed >= fallback then
+                        w.judged = true
+                        performHit(w, AutoCtx)
+                    end
+                end
+            end
+        end
+    end
+
+    if toRemove then
+        for _, arrow in ipairs(toRemove) do
+            noteWatchers[arrow] = nil
+        end
+    end
+end
+
+-- ============================================================
+-- Bind da música
+-- ============================================================
+local connections = {
+    _list = {},
+    add = function(self, signal, cb)
+        local conn = signal:Connect(cb)
+        self._list[#self._list + 1] = conn
+        return conn
+    end,
+    disconnect = function(self)
+        for _, conn in ipairs(self._list) do
+            if typeof(conn) == "RBXScriptConnection" then
+                pcall(function() conn:Disconnect() end)
+            end
+        end
+        table.clear(self._list)
+    end,
+}
+
+local function clearSongConnections()
+    connections:disconnect()
+    table.clear(st.Session)
+    table.clear(st.ActionKeyCache)
+    table.clear(st.LaneJudgmentY)
+    table.clear(noteWatchers)
+    releaseAll()
+end
+
+local function pickLocalField(fields)
+    local best, bestScore
+    for _, sideName in ipairs({"Left", "Right"}) do
+        local side = fields:FindFirstChild(sideName)
+        local inner = side and side:FindFirstChild("Inner")
+        local lane1 = inner and inner:FindFirstChild("Lane1")
+        if side and lane1 then
+            local score = (side.ZIndex or 0) * 100000 + lane1.AbsoluteSize.X
+            if not bestScore or score > bestScore then
+                best, bestScore = side, score
+            end
+        end
+    end
+    return best
+end
+
+local function enqueueNote(Holder, Arrow, Action)
+    local special = getSpecialNoteType(Arrow)
+    if special == "Death"  and st.ignoreDeath  then st.Stats.skipped += 1; return end
+    if special == "Poison" and st.ignorePoison then st.Stats.skipped += 1; return end
+
+    local quality, extra = decideAction(isHold(Arrow))
+    if quality == "Miss" then
+        st.Stats.miss += 1
+        log("Miss proposital/escolhido")
+        return
+    end
+    if quality == "Perfect" then st.Stats.perfect += 1
+    elseif quality == "Great"   then st.Stats.great += 1
+    elseif quality == "Ok"      then st.Stats.ok += 1 end
+    st.Stats.hits += 1
+
+    local w = {
+        arrowRef = Arrow,
+        decidedQuality = quality,
+        extraDelay = extra,
+    }
+    resetWatcher(w, Holder, Action)
+    if not w.judgmentY then
+        w.judgmentY = computeJudgmentY(Holder)
+        st.LaneJudgmentY[Holder] = w.judgmentY
+    end
+    w.lastY = Arrow.AbsolutePosition.Y
+    w.lastT = os.clock()
+
+    noteWatchers[Arrow] = w
+end
+
+local function bindSong()
+    clearSongConnections()
+
+    local context = PlayerGui:FindFirstChild("VSRGContext")
+    local window  = PlayerGui:FindFirstChild("Window")
+    local gameFrame = window and window:FindFirstChild("Game")
+    local fields  = gameFrame and gameFrame:FindFirstChild("Fields")
+    if not (context and fields) then
+        st.boundWindow = nil
+        st.boundLanes = 0
+        return false
+    end
+
+    local localField = pickLocalField(fields)
+    local inner = localField and localField:FindFirstChild("Inner")
+    if not inner then
+        st.boundWindow = nil
+        st.boundLanes = 0
+        return false
+    end
+
+    local entries = {}
+    for i = 1, 12 do
+        local Holder = inner:FindFirstChild("Lane" .. i)
+        local action = context:FindFirstChild("Lane" .. i)
+        local notes = Holder and Holder:FindFirstChild("Notes")
+        if Holder and action and notes then
+            st.Session[Holder.Name] = action
+            local jY = computeJudgmentY(Holder)
+            if jY then st.LaneJudgmentY[Holder] = jY end
+            table.insert(entries, { Holder = Holder, Notes = notes, Action = action })
+        end
+    end
+
+    AutoCtx = {
+        enabled = true,
+        offsetMs = st.off,
+        baseOffset = st.baseMs / 1000,
+        tapMs = st.tapMs,
+        relMs = st.relMs,
+        holdTick = st.holdTick,
+        maxHold = st.maxHold,
+        laneDown = st.laneDown,
+        laneCount = st.laneCount,
+        press = pressLane,
+        release = releaseLane,
+    }
+
+    for _, entry in ipairs(entries) do
+        local Holder = entry.Holder
+        local Notes  = entry.Notes
+        local Action = entry.Action
+
+        connections:add(Notes.ChildAdded, function(Arrow)
+            task.defer(function()
+                if not Arrow or not Arrow.Visible then return end
+                if not st.auto then return end
+
+                local jY = computeJudgmentY(Holder)
+                if jY then st.LaneJudgmentY[Holder] = jY end
+
+                if st.timingMode == "Auto" then
+                    enqueueNote(Holder, Arrow, Action)
+                else
+                    local special = getSpecialNoteType(Arrow)
+                    if special == "Death"  and st.ignoreDeath  then st.Stats.skipped += 1; return end
+                    if special == "Poison" and st.ignorePoison then st.Stats.skipped += 1; return end
+
+                    local quality, extra = decideAction(isHold(Arrow))
+                    if quality == "Miss" then
+                        st.Stats.miss += 1
+                        return
+                    end
+                    if quality == "Perfect" then st.Stats.perfect += 1
+                    elseif quality == "Great"   then st.Stats.great += 1
+                    elseif quality == "Ok"      then st.Stats.ok += 1 end
+                    st.Stats.hits += 1
+
+                    local w = {
+                        arrowRef = Arrow,
+                        holder = Holder,
+                        action = Action,
+                        extraDelay = extra,
+                    }
+                    task.spawn(function()
+                        local delay = st.baseMs / 1000 + st.off / 1000 + extra
+                        if delay > 0 then task.wait(delay) end
+                        if not st.auto or not Arrow.Parent or not Arrow.Visible then return end
+                        performHit(w, AutoCtx)
+                    end)
+                end
+            end)
+        end)
+    end
+
+    st.boundWindow = window
+    st.boundLanes = #entries
+    log("bindSong: lanes bound =", #entries)
+    return #entries > 0
+end
+
+-- ============================================================
+-- Watch de janela / rebind
+-- ============================================================
+local function fieldWatch()
+    if not st.alive then return end
+
+    local window  = PlayerGui:FindFirstChild("Window")
+    local context = PlayerGui:FindFirstChild("VSRGContext")
+
+    if window ~= st.boundWindow then
+        st.boundWindow = window
+        if window and context then
+            task.defer(bindSong)
+        else
+            releaseAll()
+            table.clear(st.Session)
+            table.clear(noteWatchers)
+            st.boundLanes = 0
+        end
+    elseif window and context and next(st.Session) == nil then
+        task.defer(bindSong)
+    end
+
+    if not st.auto then releaseAll() end
+end
+
+-- ============================================================
+-- Unload
+-- ============================================================
+function st:Unload()
+    if not self.alive then return end
+    self.alive = false
+    self.auto = false
+
+    releaseAll()
+    connections:disconnect()
+    table.clear(noteWatchers)
+
+    for _, key in ipairs({"FieldWatch","GuiWatch","ConfigWatch","SpecialPageWatch","NoteWatcherHeartbeat"}) do
+        local c = self[key]
+        if c then
+            pcall(function() c:Disconnect() end)
+            self[key] = nil
+        end
+    end
+
+    for _, binding in pairs(self.ScriptBindings or {}) do
+        if binding and binding.Parent then
+            pcall(function() binding:Destroy() end)
+        end
+    end
+    table.clear(self.ScriptBindings)
+    table.clear(self.ActionKeyCache)
+    table.clear(self.LaneJudgmentY)
+
+    if self.RayfieldWindow and not self.RayfieldWindow.unloaded then
+        pcall(function() self.RayfieldWindow:Unload() end)
+    end
+    self.RayfieldWindow = nil
+
+    if ENV.__FunkyFridayAutoplayer == self then
+        ENV.__FunkyFridayAutoplayer = nil
+    end
+    log("Unloaded.")
+end
+
+-- ============================================================
+-- Rayfield UI
+-- ============================================================
+local RayfieldOk, Rayfield = pcall(function()
+    return loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+end)
+
+if not RayfieldOk or not Rayfield then
+    warn("[FF-Autoplayer | fal] Não foi possível carregar o Rayfield Gen2. Abortando UI.")
+    return
+end
+
+local Window = Rayfield:CreateWindow({
+    name = "Funky Friday Autoplayer",
+    subtitle = "by fal — Rayfield Gen2",
+    sidebarLayout = true,
+    showName = "Funky Friday",
+    showIcon = 0,
+    configuration = {
+        autoSave = true,
+        autoLoad = true,
+        fileName = "FunkyFridayAutoplayer",
+    }
+})
+st.RayfieldWindow = Window
+
+-- ---------- Aba Autoplay ----------
+local TabAutoplay = Window:CreateTab({ name = "Autoplay" })
+local GrpMain     = TabAutoplay:CreateGroup({ direction = "column" })
+local GrpInput    = TabAutoplay:CreateGroup({ direction = "column" })
+
+GrpMain:CreateSection({ name = "Playback" })
+GrpMain:CreateText({ name = "Info", text = "Ativa/desativa o autoplayer em tempo real." })
+
+GrpMain:CreateToggle({
+    name = "Autoplay",
+    flag = "FF_Autoplay",
+    value = true,
+    callback = function(v)
+        st.auto = v
+        if not v then releaseAll() end
+        log("Autoplay =", v)
+    end,
+})
+
+GrpMain:CreateToggle({
+    name = "Enable Hold Notes",
+    flag = "FF_EnableHolds",
+    value = true,
+    callback = function(v) st.enableHolds = v end,
+})
+
+GrpMain:CreateSlider({
+    name = "Hit Accuracy",
+    flag = "FF_Accuracy",
+    range = {0, 100},
+    increment = 1,
+    value = 100,
+    suffix = "%",
+    callback = function(v) st.accuracy = clamp(tonumber(v) or 100, 0, 100) end,
+})
+
+GrpInput:CreateSection({ name = "Input" })
+if #InputModes > 1 then
+    GrpInput:CreateDropdown({
+        name = "Input Mode",
+        flag = "FF_InputMode",
+        options = InputModes,
+        value = DefaultInputMode,
+        forgetState = true,
+        multiSelect = false,
+        callback = function(v)
+            releaseAll()
+            st.inMode = table.find(InputModes, v) and v or DefaultInputMode
+            log("Input mode =", st.inMode)
+        end,
+    })
+else
+    GrpInput:CreateText({ name = "Input Mode", text = "Único disponível: " .. DefaultInputMode })
+end
+
+if IsDesktop then
+    GrpInput:CreateText({
+        name = "PC Warning",
+        text = "O FF para de ler inputs quando a janela perde foco.",
+    })
+end
+if IsExternal then
+    GrpInput:CreateText({
+        name = "External Executor",
+        text = "Alguns métodos de input foram filtrados.",
+    })
+end
+
+-- ---------- Aba Timing ----------
+local TabTiming = Window:CreateTab({ name = "Timing" })
+local GrpTiming = TabTiming:CreateGroup({ direction = "column" })
+GrpTiming:CreateSection({ name = "Modo" })
+GrpTiming:CreateText({
+    name = "Info",
+    text = "Auto mede a velocidade real das setas e funciona em qualquer scroll speed. Fixed usa um delay fixo (calibre manualmente).",
+})
+
+GrpTiming:CreateDropdown({
+    name = "Timing Mode",
+    flag = "FF_TimingMode",
+    options = {"Auto", "Fixed"},
+    value = "Auto",
+    multiSelect = false,
+    callback = function(v)
+        st.timingMode = v
+        table.clear(st.NoteWatchers)
+        log("Timing mode =", v)
+    end,
+})
+
+GrpTiming:CreateSection({ name = "Ajustes Finos" })
+GrpTiming:CreateSlider({
+    name = "Timing Offset",
+    flag = "FF_TimingOffset",
+    range = {-150, 150},
+    increment = 1,
+    value = -139,
+    suffix = "ms",
+    callback = function(v) st.off = tonumber(v) or -139 end,
+})
+
+GrpTiming:CreateSlider({
+    name = "Fixed Delay (fallback)",
+    flag = "FF_BaseDelay",
+    range = {80, 600},
+    increment = 1,
+    value = 80,
+    suffix = "ms",
+    callback = function(v) st.baseMs = clamp(tonumber(v) or 80, 80, 600) end,
+})
+
+GrpTiming:CreateSlider({
+    name = "Tap Hold Time",
+    flag = "FF_TapMs",
+    range = {5, 250},
+    increment = 1,
+    value = 5,
+    suffix = "ms",
+    callback = function(v) st.tapMs = clamp(tonumber(v) or 5, 5, 250) end,
+})
+
+GrpTiming:CreateSlider({
+    name = "Release Delay",
+    flag = "FF_RelMs",
+    range = {0, 100},
+    increment = 1,
+    value = 0,
+    suffix = "ms",
+    callback = function(v) st.relMs = clamp(tonumber(v) or 0, 0, 100) end,
+})
+
+GrpTiming:CreateSlider({
+    name = "Max Hold Time",
+    flag = "FF_MaxHold",
+    range = {1, 20},
+    increment = 1,
+    value = 1,
+    suffix = "s",
+    callback = function(v) st.maxHold = clamp(tonumber(v) or 1, 1, 20) end,
+})
+
+GrpTiming:CreateSection({ name = "Velocity Aware" })
+GrpTiming:CreateText({
+    name = "Hint",
+    text = "Ajustes do modo Auto. Mexa apenas se notar imprecisão em scroll speeds extremos.",
+})
+
+GrpTiming:CreateSlider({
+    name = "Min Velocity (px/s)",
+    flag = "FF_MinVel",
+    range = {20, 500},
+    increment = 10,
+    value = 50,
+    callback = function(v) st.minVelocity = clamp(tonumber(v) or 50, 20, 500) end,
+})
+
+GrpTiming:CreateSlider({
+    name = "Velocity Smoothing",
+    flag = "FF_VelSmooth",
+    range = {0, 100},
+    increment = 1,
+    value = 0,
+    suffix = "%",
+    callback = function(v)
+        st.velocitySmoothing = clamp((tonumber(v) or 0) / 100, 0, 1)
+    end,
+})
+
+-- ---------- Aba Humanização ----------
+local TabHuman = Window:CreateTab({ name = "Humanização" })
+local GrpHum = TabHuman:CreateGroup({ direction = "column" })
+GrpHum:CreateSection({ name = "Human-like" })
+GrpHum:CreateText({
+    name = "Info",
+    text = "Torna o timing menos robótico.",
+})
+
+GrpHum:CreateToggle({
+    name = "Enable Humanization",
+    flag = "FF_Humanize",
+    value = true,
+    callback = function(v) st.humanize = v end,
+})
+
+GrpHum:CreateSlider({
+    name = "Timing Jitter (σ)",
+    flag = "FF_Jitter",
+    range = {0, 40},
+    increment = 1,
+    value = 4,
+    suffix = "ms",
+    callback = function(v) st.jitterMs = clamp(tonumber(v) or 4, 0, 40) end,
+})
+
+GrpHum:CreateSlider({
+    name = "Forced Miss Chance",
+    flag = "FF_MissChance",
+    range = {0, 30},
+    increment = 1,
+    value = 0,
+    suffix = "%",
+    callback = function(v) st.missChance = clamp(tonumber(v) or 0, 0, 30) end,
+})
+
+GrpHum:CreateSlider({
+    name = "Min Notes Between Misses",
+    flag = "FF_MissCD",
+    range = {1, 30},
+    increment = 1,
+    value = 6,
+    callback = function(v) st.missCooldownNotes = clamp(tonumber(v) or 6, 1, 30) end,
+})
+
+-- ---------- Aba Notas Especiais ----------
+local TabSpecial = Window:CreateTab({ name = "Notas Especiais" })
+local GrpSpec = TabSpecial:CreateGroup({ direction = "column" })
+GrpSpec:CreateSection({ name = "Filtros" })
+GrpSpec:CreateText({
+    name = "Info",
+    text = "Notas Death e Poison danificam seu HP se tocadas.",
+})
+
+GrpSpec:CreateToggle({
+    name = "Ignore Death Notes",
+    flag = "FF_IgnoreDeath",
+    value = true,
+    callback = function(v) st.ignoreDeath = v end,
+})
+
+GrpSpec:CreateToggle({
+    name = "Ignore Poison Notes",
+    flag = "FF_IgnorePoison",
+    value = true,
+    callback = function(v) st.ignorePoison = v end,
+})
+
+GrpSpec:CreateButton({
+    name = "Refresh Special Skins",
+    callback = function()
+        task.defer(function()
+            local ok = refreshSpecialNoteSkins()
+            if Window.Notify then
+                Window:Notify({
+                    title = "Special Notes",
+                    content = ok and "Skins atualizadas." or "Falha ao atualizar (UI mudou?).",
+                    duration = 3,
+                })
+            end
+        end)
+    end,
+})
+
+-- ---------- Aba Status / Debug ----------
+local TabStatus = Window:CreateTab({ name = "Status/Debug" })
+local GrpStatus = TabStatus:CreateGroup({ direction = "column" })
+local GrpDebug  = TabStatus:CreateGroup({ direction = "column" })
+
+GrpStatus:CreateSection({ name = "Status" })
+GrpStatus:CreateText({ name = "Author", text = "Script feito por fal." })
+local statusLabel = GrpStatus:CreateText({ name = "Live", text = "aguardando..." })
+
+GrpStatus:CreateButton({
+    name = "Reset Stats",
+    callback = function()
+        for k, _ in pairs(st.Stats) do st.Stats[k] = 0 end
+        st.Stats.lastReset = os.clock()
+        log("Stats reset")
+    end,
+})
+
+GrpDebug:CreateSection({ name = "Debug" })
+GrpDebug:CreateToggle({
+    name = "Debug Mode",
+    flag = "FF_Debug",
+    value = false,
+    callback = function(v) st.debug = v end,
+})
+
+-- ---------- Aba Config ----------
+local TabConfig = Window:CreateTab({ name = "Config" })
+local GrpKeys   = TabConfig:CreateGroup({ direction = "column" })
+local GrpMisc   = TabConfig:CreateGroup({ direction = "column" })
+
+GrpKeys:CreateSection({ name = "Keybinds" })
+GrpKeys:CreateText({
+    name = "Info",
+    text = "RightShift alterna autoplay, RightControl esconde a UI (fallback).",
+})
+
+pcall(function()
+    if GrpKeys.CreateKeybind then
+        GrpKeys:CreateKeybind({
+            name = "Toggle Autoplay",
+            flag = "FF_KeyAutoplay",
+            default = Enum.KeyCode.RightShift,
+            callback = function(kc) st.keyAutoplay = kc end,
+        })
+        GrpKeys:CreateKeybind({
+            name = "Toggle UI",
+            flag = "FF_KeyHideUi",
+            default = Enum.KeyCode.RightControl,
+            callback = function(kc) st.keyHideUi = kc end,
+        })
+    end
+end)
+
+GrpMisc:CreateSection({ name = "Manutenção" })
+GrpMisc:CreateButton({
+    name = "Rebind Song",
+    callback = function()
+        task.defer(function()
+            local ok = bindSong()
+            if Window.Notify then
+                Window:Notify({
+                    title = "Rebind",
+                    content = ok and ("Bound " .. tostring(st.boundLanes) .. " lanes.") or "Nenhuma música detectada.",
+                    duration = 3,
+                })
+            end
+        end)
+    end,
+})
+
+GrpMisc:CreateButton({
+    name = "Unload Script",
+    callback = function() st:Unload() end,
+})
+
+GrpMisc:CreateText({
+    name = "Credits",
+    text = "Funky Friday Autoplayer — feito por fal.",
+})
+
+-- ---------- Keybinds UIS ----------
+connections:add(UserInputService.InputBegan, function(input, gameProcessed)
+    if gameProcessed then return end
+
+    if input.KeyCode == st.keyAutoplay then
+        st.auto = not st.auto
+        if not st.auto then releaseAll() end
+        log("Keybind toggle autoplay ->", st.auto)
+        if Window.Notify then
+            Window:Notify({ title = "Autoplay", content = st.auto and "ON" or "OFF", duration = 2 })
+        end
+    elseif input.KeyCode == st.keyHideUi then
+        if st.RayfieldWindow and not st.RayfieldWindow.unloaded then
+            st.RayfieldWindow:ToggleHide()
+        end
+    end
+end)
+
+-- ---------- Status updater ----------
+task.spawn(function()
+    while st.alive do
+        task.wait(0.5)
+        local s = st.Stats
+        local line = string.format(
+            "[fal] bound=%s | lanes=%d | mode=%s | timing=%s | hits=%d (P:%d G:%d O:%d) miss=%d skip=%d | specials=%s",
+            tostring(st.boundWindow ~= nil),
+            st.boundLanes,
+            st.inMode,
+            st.timingMode,
+            s.hits, s.perfect, s.great, s.ok, s.miss, s.skipped,
+            tostring(st.SpecialNotes.Ready)
+        )
+        pcall(function() statusLabel:Set(line) end)
+    end
+end)
+
+-- ---------- Watches ----------
+local specialUi = getSpecialSettingsUi()
+if specialUi.Configuration then
+    st.ConfigWatch = specialUi.Configuration:GetPropertyChangedSignal("Visible"):Connect(function()
+        if not specialUi.Configuration.Visible then
+            task.defer(refreshSpecialNoteSkins)
+        end
+    end)
+end
+if specialUi.NotesPage then
+    st.SpecialPageWatch = specialUi.NotesPage:GetPropertyChangedSignal("Visible"):Connect(function()
+        if specialUi.NotesPage.Visible then
+            task.defer(refreshSpecialNoteSkins)
+        end
+    end)
+end
+
+st.GuiWatch = PlayerGui.ChildAdded:Connect(function(child)
+    if child.Name == "Window" or child.Name == "VSRGContext" then
+        task.defer(function()
+            if PlayerGui:FindFirstChild("Window") and PlayerGui:FindFirstChild("VSRGContext") then
+                bindSong()
+            end
+        end)
+    end
+end)
+
+-- ---------- Boot ----------
+task.defer(refreshSpecialNoteSkins)
+bindSong()
+st.FieldWatch = RunService.Heartbeat:Connect(fieldWatch)
+st.NoteWatcherHeartbeat = RunService.Heartbeat:Connect(noteWatcherTick)
+
+Window:Notify({
+    title = "Funky Friday Autoplayer",
+    content = (IsExternal and "External executor support loaded." or "Autoplayer loaded.") .. " — by fal",
+    duration = 4,
+})
